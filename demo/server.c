@@ -202,11 +202,6 @@ void *handle_http_request(int client_socket)
     snprintf(full_path, sizeof(full_path), "%s%s", docroot, decoded_path);
 
     struct stat file_stat;
-    // if (stat(full_path, &file_stat) < 0) {
-    //     send_response(client_socket, "HTTP/1.0 404 Not Found\r\n\r\n", NULL);
-    //     close(client_socket);
-    //     return;
-    // }
     int exists = stat(full_path, &file_stat);
     if (exists == 0 && S_ISDIR(file_stat.st_mode) && full_path[strlen(full_path) - 1] != '/')
     {
@@ -245,13 +240,141 @@ void *handle_http_request(int client_socket)
     return NULL;
 }
 
-// Function to handle requests on the HTTPS port (443)
-void *handle_https_request(int client_socket)
-{
-}
+SSL_CTX *ssl_ctx;
 
 void init_openssl(char *cert_path, char *cert_crt_path, char *cert_key_path)
 {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+
+    ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (!ssl_ctx)
+    {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_certificate_file(ssl_ctx, cert_crt_path, SSL_FILETYPE_PEM) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, cert_key_path, SSL_FILETYPE_PEM) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void send_file_over_ssl(SSL *ssl, const char *filename)
+{
+    char buf[BUFSIZ];
+    size_t num_read;
+
+    FILE *fp = fopen(filename, "rb");
+    if (fp == NULL)
+    {
+        perror("fopen");
+        return;
+    }
+
+    while ((num_read = fread(buf, 1, sizeof buf, fp)) > 0)
+    {
+        if (SSL_write(ssl, buf, num_read) != num_read)
+        {
+            perror("SSL_write");
+            break;
+        }
+    }
+
+    fclose(fp);
+}
+
+void *handle_https_request(int client_socket)
+{
+    SSL *ssl = SSL_new(ssl_ctx);
+    SSL_set_fd(ssl, client_socket);
+
+    if (SSL_accept(ssl) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+    }
+    else
+    {
+        char buffer[BUFFER_SIZE];
+        SSL_read(ssl, buffer, sizeof(buffer));
+
+        char method[10], path[1024];
+        sscanf(buffer, "%s %s", method, path);
+        char decoded_path[1024];
+        url_decode(decoded_path, path);
+        if (strcasecmp(method, "GET") != 0)
+        {
+            SSL_write(ssl, "HTTP/1.0 501 Not Implemented\r\n\r\n", strlen("HTTP/1.0 501 Not Implemented\r\n\r\n"));
+            SSL_write(ssl, "<h1>501 Not Implemented</h1>", strlen("<h1>501 Not Implemented</h1>"));
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(client_socket);
+            return NULL;
+        }
+        char *query_string = strchr(decoded_path, '?');
+        if (query_string)
+        {
+            *query_string = '\0'; // Terminate the path at the start of the query string
+        }
+        char full_path[2048];
+        snprintf(full_path, sizeof(full_path), "%s%s", docroot, decoded_path);
+
+        struct stat file_stat;
+        int exists = stat(full_path, &file_stat);
+        if (exists == 0 && S_ISDIR(file_stat.st_mode) && full_path[strlen(full_path) - 1] != '/')
+        {
+            char redirect_path[2048];
+            snprintf(redirect_path, sizeof(redirect_path), "HTTP/1.0 301 Moved Permanently\r\nLocation: %s/\r\n\r\n", path);
+            SSL_write(ssl, redirect_path, strlen(redirect_path));
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(client_socket);
+            return NULL;
+        }
+        else if (exists == 0 && S_ISDIR(file_stat.st_mode))
+        {
+            strncat(full_path, "index.html", sizeof(full_path) - strlen(full_path) - 1);
+            if (stat(full_path, &file_stat) < 0)
+            {
+                SSL_write(ssl, "HTTP/1.0 403 Forbidden\r\n\r\n", strlen("HTTP/1.0 403 Forbidden\r\n\r\n"));
+                SSL_write(ssl, "<h1>403 Forbidden</h1>", strlen("<h1>403 Forbidden</h1>"));
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                close(client_socket);
+                return NULL;
+            }
+        }
+        else if (exists < 0)
+        {
+            SSL_write(ssl, "HTTP/1.0 404 Not Found\r\n\r\n", strlen("HTTP/1.0 404 Not Found\r\n\r\n"));
+            SSL_write(ssl, "<h1>404 Not Found</h1>", strlen("<h1>404 Not Found</h1>"));
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(client_socket);
+            return NULL;
+        }
+        if (S_ISREG(file_stat.st_mode))
+        {
+            SSL_write(ssl, "HTTP/1.0 200 OK\r\n\r\n", strlen("HTTP/1.0 200 OK\r\n\r\n")); // Add this line
+            send_file_over_ssl(ssl, full_path);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(client_socket);
+            return NULL;
+        }
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    return NULL;
 }
 
 // Function to create a non-blocking socket and bind it to the specified port
@@ -381,6 +504,5 @@ int main(int argc, char *argv[])
             }
         }
     }
-
     return 0;
 }
